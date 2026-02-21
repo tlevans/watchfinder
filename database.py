@@ -83,8 +83,8 @@ def upsert_listing(data: dict) -> tuple[int, bool]:
                     price=?, currency=?, condition=?, seller=?,
                     description=?, image_url=?, date_listed=?,
                     price_rating=?, market_price=?, price_delta_pct=?,
-                    watchcharts_url=?, raw_json=?, is_active=1
-                WHERE listing_url=?
+                    watchcharts_url=?, raw_json=?
+                WHERE listing_url=? AND is_active=1
             """, (
                 data.get("title"), data.get("brand"), data.get("model"),
                 data.get("reference"), data.get("year"),
