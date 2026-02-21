@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WatchFinder — Birth Year Watch Tracker</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <!-- ═══ HEADER ═══════════════════════════════════════════════════════════ -->
+  <header>
+    <div class="header-inner">
+      <div class="header-title">
+        <span class="logo">⌚</span>
+        <div>
+          <h1>WatchFinder</h1>
+          <p class="subtitle">Birth Year Watch Tracker · Target: <strong id="targetYearBadge">2007</strong></p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button id="btnSettings" class="btn btn-secondary" title="Settings">⚙ Settings</button>
+        <button id="btnScrape" class="btn btn-primary">
+          <span class="btn-icon">⟳</span> Scan Listings
+        </button>
+        <div id="scrapeStatus" class="scrape-status hidden"></div>
+      </div>
+    </div>
+  </header>
+
+  <!-- ═══ STATS BAR ════════════════════════════════════════════════════════ -->
+  <div class="stats-bar" id="statsBar">
+    <div class="stat-card">
+      <span class="stat-num" id="statTotal">—</span>
+      <span class="stat-label">Total Listings</span>
+    </div>
+    <div class="stat-card highlight">
+      <span class="stat-num" id="stat2007">—</span>
+      <span class="stat-label">2007 Watches</span>
+    </div>
+    <div class="stat-card rating-great">
+      <span class="stat-num" id="statGreat">—</span>
+      <span class="stat-label">Great Deals</span>
+    </div>
+    <div class="stat-card rating-good">
+      <span class="stat-num" id="statGood">—</span>
+      <span class="stat-label">Good Deals</span>
+    </div>
+    <div class="stat-card rating-fair">
+      <span class="stat-num" id="statFair">—</span>
+      <span class="stat-label">Fair Price</span>
+    </div>
+    <div class="stat-card rating-high">
+      <span class="stat-num" id="statHigh">—</span>
+      <span class="stat-label">High Price</span>
+    </div>
+  </div>
+
+  <!-- ═══ MAIN LAYOUT ══════════════════════════════════════════════════════ -->
+  <div class="main-layout">
+
+    <!-- ── FILTER SIDEBAR ──────────────────────────────────────────────── -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <h2>Filters</h2>
+        <button id="btnClearFilters" class="btn-link">Clear all</button>
+      </div>
+
+      <div class="filter-group">
+        <label class="filter-label">Search</label>
+        <input id="fSearch" type="text" class="filter-input" placeholder="Title, model, reference…">
+      </div>
+
+      <div class="filter-group">
+        <label class="filter-label">Brand</label>
+        <select id="fBrand" class="filter-select">
+          <option value="">All brands</option>
+        </select>
+      </div>
+
+      <div class="filter-group">
+        <label class="filter-label">Production Year</label>
+        <div class="range-row">
+          <input id="fYearMin" type="number" class="filter-input short" placeholder="From" min="1950" max="2025">
+          <span class="range-sep">–</span>
+          <input id="fYearMax" type="number" class="filter-input short" placeholder="To"   min="1950" max="2025">
+        </div>
+        <button class="chip-btn" data-year="2007">2007 only</button>
+      </div>
+
+      <div class="filter-group">
+        <label class="filter-label">Price (USD)</label>
+        <div class="range-row">
+          <input id="fPriceMin" type="number" class="filter-input short" placeholder="Min" min="0">
+          <span class="range-sep">–</span>
+          <input id="fPriceMax" type="number" class="filter-input short" placeholder="Max">
+        </div>
+      </div>
+
+      <div class="filter-group">
+        <label class="filter-label">Deal Rating</label>
+        <div class="checkbox-group">
+          <label class="checkbox-label"><input type="checkbox" class="rating-cb" value="Great"><span class="badge badge-great">Great</span></label>
+          <label class="checkbox-label"><input type="checkbox" class="rating-cb" value="Good"><span class="badge badge-good">Good</span></label>
+          <label class="checkbox-label"><input type="checkbox" class="rating-cb" value="Fair"><span class="badge badge-fair">Fair</span></label>
+          <label class="checkbox-label"><input type="checkbox" class="rating-cb" value="High"><span class="badge badge-high">High</span></label>
+        </div>
+      </div>
+
+      <div class="filter-group">
+        <label class="filter-label">Condition</label>
+        <select id="fCondition" class="filter-select">
+          <option value="">Any condition</option>
+          <option>New/Unworn</option>
+          <option>Mint</option>
+          <option>Excellent</option>
+          <option>Very Good</option>
+          <option>Good</option>
+          <option>Fair</option>
+        </select>
+      </div>
+
+      <div class="filter-group">
+        <label class="filter-label">Source</label>
+        <select id="fSource" class="filter-select">
+          <option value="">All sources</option>
+        </select>
+      </div>
+
+      <div class="filter-group">
+        <label class="filter-label">Sort By</label>
+        <select id="fSort" class="filter-select">
+          <option value="date_found:desc">Newest Found</option>
+          <option value="date_found:asc">Oldest Found</option>
+          <option value="price:asc">Price: Low → High</option>
+          <option value="price:desc">Price: High → Low</option>
+          <option value="year:desc">Year: New → Old</option>
+          <option value="year:asc">Year: Old → New</option>
+          <option value="price_rating:asc">Best Deals First</option>
+        </select>
+      </div>
+
+      <button id="btnApply" class="btn btn-primary full-width">Apply Filters</button>
+    </aside>
+
+    <!-- ── LISTINGS AREA ─────────────────────────────────────────────────── -->
+    <main class="listings-area">
+      <div class="listings-toolbar">
+        <span id="listingsCount" class="count-label">Loading…</span>
+        <div class="view-toggle">
+          <button class="view-btn active" data-view="grid" title="Grid view">⊞</button>
+          <button class="view-btn" data-view="list" title="List view">≡</button>
+        </div>
+      </div>
+
+      <div id="listingsGrid" class="listings-grid"></div>
+
+      <div id="emptyState" class="empty-state hidden">
+        <div class="empty-icon">🔍</div>
+        <h3>No listings found</h3>
+        <p>Try adjusting your filters or click <strong>Scan Listings</strong> to fetch new ones.</p>
+      </div>
+
+      <div id="loadingState" class="loading-state">
+        <div class="spinner"></div>
+        <p>Loading listings…</p>
+      </div>
+    </main>
+  </div>
+
+  <!-- ═══ DETAIL MODAL ═════════════════════════════════════════════════════ -->
+  <div id="modal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content">
+      <button class="modal-close" id="modalClose">✕</button>
+      <div id="modalBody"></div>
+    </div>
+  </div>
+
+  <!-- ═══ SCRAPE MODAL ═════════════════════════════════════════════════════ -->
+  <div id="scrapeModal" class="modal hidden" role="dialog">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content scrape-modal-content">
+      <h2>Scan Listings</h2>
+      <div class="notice notice-info">
+        <strong>Note:</strong> RolexForums uses Cloudflare protection which may block cloud-hosted scrapers.
+        For best results, run WatchFinder <strong>locally</strong> on your home network.
+        Reddit r/Watchexchange may also block cloud IPs.
+        Add your session cookies in <strong>Settings</strong> to authenticate.
+      </div>
+      <div class="form-group">
+        <label>Pages to scrape per source</label>
+        <input id="scrapePages" type="number" value="3" min="1" max="20" class="filter-input">
+      </div>
+      <div class="form-group">
+        <label>Target birth year (for price analysis)</label>
+        <input id="scrapeTargetYear" type="number" value="2007" min="1950" max="2025" class="filter-input">
+      </div>
+      <div class="form-group">
+        <label>Sources to scrape</label>
+        <div id="scrapeSourceChecks" class="checkbox-group"></div>
+      </div>
+      <div class="modal-actions">
+        <button id="btnScrapeCancel" class="btn btn-secondary">Cancel</button>
+        <button id="btnScrapeConfirm" class="btn btn-primary">Start Scan</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ SETTINGS MODAL ═══════════════════════════════════════════════════ -->
+  <div id="settingsModal" class="modal hidden" role="dialog">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content settings-modal-content">
+      <button class="modal-close" id="settingsClose">✕</button>
+      <h2>⚙ Settings</h2>
+
+      <div class="notice notice-info" style="margin-bottom:20px">
+        <strong>Forum Cookie Authentication</strong><br>
+        Many watch forums use Cloudflare Bot Management to block automated scrapers.
+        To scrape them, log in to the forum in your browser, then copy your session cookies
+        (from browser DevTools → Application → Cookies) and paste them below.
+        Cookies are stored locally in your SQLite database.
+      </div>
+
+      <div id="cookieFields"></div>
+
+      <h3 style="margin:20px 0 12px;font-size:14px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px">Defaults</h3>
+      <div class="settings-grid">
+        <div class="form-group">
+          <label>Target year</label>
+          <input id="settingTargetYear" type="number" value="2007" min="1950" max="2025" class="filter-input">
+        </div>
+        <div class="form-group">
+          <label>Pages per scrape</label>
+          <input id="settingPages" type="number" value="3" min="1" max="30" class="filter-input">
+        </div>
+      </div>
+
+      <div class="modal-actions">
+        <button id="btnSettingsCancel" class="btn btn-secondary">Cancel</button>
+        <button id="btnSettingsSave" class="btn btn-primary">Save Settings</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
