@@ -182,12 +182,17 @@ def extract_price(text: str) -> float | None:
                 after_k = text[end + 1 : end + 9].lstrip("/").lstrip()
                 if not re.match(r"YG|WG|RG|SS|gold|white|yellow|rose|ct|carat|karat", after_k, re.I):
                     is_k = True
-        raw = raw.replace(",", "")
+        # "5,5k" or "3,8k" → European decimal comma (5.5k / 3.8k = $5500 / $3800)
+        # "5,500k" or "1,234" → American thousands separator (keep as-is)
+        if is_k and re.match(r'^\d+,\d{1,2}$', raw):
+            raw = raw.replace(",", ".")
+        else:
+            raw = raw.replace(",", "")
         try:
             val = float(raw)
             if is_k:
                 val *= 1000
-            if 200 <= val <= 500_000:
+            if 100 <= val <= 500_000:
                 return round(val, 2)
         except (ValueError, AttributeError):
             pass
@@ -299,7 +304,11 @@ class BaseScraper:
                 cookie_header = "; ".join(
                     f"{k}={v}" for k, v in self.session.cookies.items()
                 )
-                headers = {"Cookie": cookie_header} if cookie_header else {}
+                # Forward all session headers (User-Agent, Accept, etc.) so the
+                # target site sees them correctly (e.g. Reddit needs Accept: application/json)
+                headers = dict(self.session.headers)
+                if cookie_header:
+                    headers["Cookie"] = cookie_header
                 for attempt in range(2):
                     resp = requests.get(
                         "https://api.scrape.do/",
@@ -676,6 +685,44 @@ class RedditWatchexchangeScraper(BaseScraper):
         )
         self.session.headers["Accept"] = "application/json"
 
+    def _fetch_op_comment(self, post_id: str, op_author: str) -> str:
+        """Fetch the first comment by the OP (post author) from a Reddit thread.
+
+        r/Watchexchange sellers post as image/gallery (empty selftext) and put
+        their structured listing details (price, year, condition, etc.) in a
+        comment. We specifically want the OP's comment, not other users' replies
+        like 'PM!' which appear first.  Falls back to first non-AutoModerator
+        comment if the OP hasn't commented yet.
+        """
+        url = f"https://www.reddit.com/r/Watchexchange/comments/{post_id}.json"
+        try:
+            resp = self._get(url)
+            if resp is None or resp.status_code != 200:
+                return ""
+            data = resp.json()
+            # Response is [post_listing, comments_listing]
+            if not isinstance(data, list) or len(data) < 2:
+                return ""
+            comments = data[1].get("data", {}).get("children", [])
+            first_non_mod = ""
+            for comment in comments:
+                c = comment.get("data", {})
+                author = c.get("author", "")
+                body = c.get("body", "")
+                if not body or body in ("[deleted]", "[removed]"):
+                    continue
+                if author.lower() == "automoderator":
+                    continue
+                # Prefer OP's own comment
+                if author.lower() == op_author.lower():
+                    return body
+                if not first_non_mod:
+                    first_non_mod = body
+            return first_non_mod
+        except Exception as e:
+            log.warning("[Reddit] Failed to fetch thread %s: %s", post_id, e)
+        return ""
+
     def _parse_post(self, post_data: dict) -> dict | None:
         title = post_data.get("title", "")
         selftext = post_data.get("selftext", "")
@@ -684,6 +731,7 @@ class RedditWatchexchangeScraper(BaseScraper):
         author = post_data.get("author", "")
         created = post_data.get("created_utc")
         flair = post_data.get("link_flair_text", "") or ""
+        post_id = post_data.get("id", "")
 
         # Only WTS and WTT (not WTB)
         if not is_for_sale(title):
@@ -694,6 +742,15 @@ class RedditWatchexchangeScraper(BaseScraper):
             return None
 
         combined = f"{title} {selftext}"
+
+        # For image/gallery posts selftext is empty; the OP's listing details
+        # (price, year, condition) live in the first non-AutoModerator comment.
+        thread_body = ""
+        if not selftext.strip() and post_id:
+            thread_body = self._fetch_op_comment(post_id, author)
+            if thread_body:
+                combined = f"{combined} {thread_body}"
+
         brand = extract_brand(title) or extract_brand(combined)
 
         # Reddit posts often have an image link as the post URL
@@ -703,6 +760,27 @@ class RedditWatchexchangeScraper(BaseScraper):
         elif url and "imgur.com" in url and not url.endswith(".html"):
             image_url = url + ".jpg" if "." not in url.split("/")[-1] else url
 
+        # Reddit-native images: preview.images[0].source.url (HTML-encoded)
+        if not image_url:
+            preview_imgs = post_data.get("preview", {}).get("images", [])
+            if preview_imgs:
+                src = preview_imgs[0].get("source", {}).get("url", "")
+                if src:
+                    image_url = src.replace("&amp;", "&")
+
+        # Gallery posts: media_metadata contains full-size image URLs
+        if not image_url and post_data.get("is_gallery"):
+            metadata = post_data.get("media_metadata", {})
+            for item in (post_data.get("gallery_data") or {}).get("items", []):
+                mid = item.get("media_id", "")
+                if mid and mid in metadata:
+                    m = metadata[mid]
+                    if m.get("status") == "valid":
+                        src = (m.get("s") or {}).get("u", "")
+                        if src:
+                            image_url = src.replace("&amp;", "&")
+                            break
+
         date_listed = None
         if created:
             try:
@@ -710,6 +788,7 @@ class RedditWatchexchangeScraper(BaseScraper):
             except Exception:
                 pass
 
+        description = selftext or thread_body
         return {
             "title": title,
             "brand": brand,
@@ -721,7 +800,7 @@ class RedditWatchexchangeScraper(BaseScraper):
             "condition": extract_condition(combined),
             "seller": author,
             "listing_url": permalink,
-            "description": selftext[:2000],
+            "description": description[:2000],
             "image_url": image_url,
             "date_listed": date_listed,
             "source_id": self.source_id,
@@ -743,7 +822,14 @@ class RedditWatchexchangeScraper(BaseScraper):
 
             log.info("[Reddit] Fetching page %d", page_num + 1)
             try:
-                resp = self.session.get(self.SUBREDDIT_JSON, params=params, timeout=20)
+                url_with_params = requests.Request(
+                    "GET", self.SUBREDDIT_JSON, params=params
+                ).prepare().url
+                resp = self._get(url_with_params)
+                if resp is None:
+                    stats["blocked"] = True
+                    stats["errors"] += 1
+                    break
                 if resp.status_code == 403:
                     log.warning(
                         "[Reddit] 403 — Reddit may be blocking requests from this IP "
