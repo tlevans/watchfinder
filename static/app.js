@@ -128,7 +128,7 @@ function renderCards(listings) {
     const isTarget = l.year === 2007;
 
     const imageHtml = l.image_url
-      ? `<div class="card-image"><img src="${escHtml(l.image_url)}" alt="Watch" loading="lazy" onerror="this.parentNode.innerHTML='⌚'"></div>`
+      ? `<div class="card-image"><img src="${escHtml(l.image_url)}" alt="Watch" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentNode.innerHTML='⌚'"></div>`
       : `<div class="card-image no-img">⌚</div>`;
 
     const pills = [
@@ -237,7 +237,7 @@ function openDetail(l) {
   const rating   = l.price_rating;
 
   const imageHtml = l.image_url
-    ? `<img class="detail-image" src="${escHtml(l.image_url)}" alt="Watch">` : '';
+    ? `<img class="detail-image" src="${escHtml(l.image_url)}" alt="Watch" referrerpolicy="no-referrer">` : '';
 
   const ratingHtml = rating
     ? `<span class="badge ${badgeClass(rating)}" style="font-size:14px;padding:5px 14px">${rating} Deal</span>`

@@ -26,7 +26,7 @@ db.init_db()
 
 # ── Scrape state ──────────────────────────────────────────────────────────────
 _scrape_lock = threading.Lock()
-_scrape_status = {"running": False, "last_run": None, "last_result": None}
+_scrape_status = {"running": False, "last_run": None, "last_result": None, "progress": None}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -117,6 +117,7 @@ def api_scrape():
     def _run():
         global _scrape_status
         _scrape_status["running"] = True
+        _scrape_status["progress"] = None
         try:
             cookies = _load_cookies()
             result  = sc.run_all_scrapers(
@@ -124,6 +125,7 @@ def api_scrape():
                 target_year=target_year,
                 cookies=cookies,
                 sources=sources_req,
+                progress_callback=lambda p: _scrape_status.update({"progress": p}),
             )
             _scrape_status["last_result"] = result
             _scrape_status["last_run"] = datetime.utcnow().isoformat()
@@ -156,6 +158,7 @@ def api_listing_detail(listing_id):
     if not row:
         abort(404)
     return jsonify(dict(row))
+
 
 
 @app.route("/api/import", methods=["POST"])

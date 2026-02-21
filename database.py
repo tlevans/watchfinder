@@ -244,6 +244,14 @@ def mark_source_scraped(source_id: int):
         )
 
 
+def listing_url_exists(url: str) -> bool:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM listings WHERE listing_url = ?", (url,)
+        ).fetchone()
+        return row is not None
+
+
 def get_source_id(name: str) -> int | None:
     with get_conn() as conn:
         row = conn.execute("SELECT id FROM sources WHERE name=?", (name,)).fetchone()

@@ -11,16 +11,36 @@ Bot Management. Scraping works best when:
   1. Running on a residential IP (run the app locally, not on a cloud server)
   2. Using an authenticated session (provide cookies via the Settings UI)
 """
+import hashlib
+import mimetypes
+import os
 import re
 import time
 import logging
+import threading
 import requests
 from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from urllib.parse import urljoin
+from pathlib import Path
+from urllib.parse import urljoin, quote_plus
 
 import database as db
 import price_checker
+
+# Load .env
+_env_path = Path(__file__).parent / ".env"
+if _env_path.exists():
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _, _v = _line.partition("=")
+                os.environ.setdefault(_k.strip(), _v.strip())
+
+SCRAPE_DO_KEY = os.environ.get("SCRAPE_DO_API_KEY", "")
+
+IMAGE_DIR = Path(__file__).parent / "static" / "images"
 
 log = logging.getLogger(__name__)
 
@@ -47,9 +67,13 @@ BASE_HEADERS = {
 
 YEAR_RE = re.compile(r"\b(19[5-9]\d|200[0-9]|201[0-9]|202[0-5])\b")
 PRICE_RE = re.compile(
-    r"\$\s*([\d,]+(?:\.\d{1,2})?)"          # $1,234.00
-    r"|([\d,]+(?:\.\d{1,2})?)\s*USD"        # 1234 USD
-    r"|([\d,.]+)\s*k\b"                      # 8.5k / 8k
+    r"\$\s*([\d,]+(?:\.\d{1,2})?)"                                     # $1,234.00
+    r"|([\d,]+(?:\.\d{1,2})?)\s*USD"                                   # 1234 USD
+    r"|([\d,.]+)\s*k(?!\s*\/?\s*(?:YG|WG|RG|SS|gold|white|yellow|rose|ct|carat|karat))\b" # 8.5k / 8k (not "18k gold/YG/WG/RG/SS" or "18K/SS")
+    r"|USD\s*([\d,]+(?:\.\d{1,2})?)"                                   # USD 1234
+    r"|(?:asking|priced?\s*(?:at|:)?)\s*\$?\s*([\d,]+(?:\.\d{1,2})?)" # asking/price 8500
+    r"|([\d,]+(?:\.\d{1,2})?)\s*(?:obo|shipped|firm|tyd)\b",          # 8500 OBO/shipped
+    re.IGNORECASE,
 )
 REFERENCE_RE = re.compile(
     r"\b(1\d{4,5}[A-Z]{0,3}"               # Rolex 5-6 digit ± suffix
@@ -144,11 +168,24 @@ CONDITION_MAP = {
 
 def extract_price(text: str) -> float | None:
     for m in PRICE_RE.finditer(text):
-        dollar, usd, k = m.group(1), m.group(2), m.group(3)
-        raw = (dollar or usd or k or "").replace(",", "")
+        # Group 3 is the explicit k-multiplier group (e.g. "8.5k")
+        is_k = m.group(3) is not None
+        raw = next((g for g in m.groups() if g is not None), None)
+        if raw is None:
+            continue
+        # If a non-k pattern matched (e.g. "asking 8.5"), check whether the
+        # captured number is immediately followed by a 'k' multiplier that the
+        # pattern didn't consume (e.g. "asking 8.5k obo").
+        if not is_k:
+            end = m.end()
+            if end < len(text) and text[end].lower() == "k":
+                after_k = text[end + 1 : end + 9].lstrip("/").lstrip()
+                if not re.match(r"YG|WG|RG|SS|gold|white|yellow|rose|ct|carat|karat", after_k, re.I):
+                    is_k = True
+        raw = raw.replace(",", "")
         try:
             val = float(raw)
-            if k:
+            if is_k:
                 val *= 1000
             if 200 <= val <= 500_000:
                 return round(val, 2)
@@ -246,24 +283,72 @@ class BaseScraper:
 
     def _get(self, url: str, **kwargs) -> requests.Response | None:
         try:
-            resp = self.session.get(url, timeout=20, **kwargs)
-            if resp.status_code == 403 and "Just a moment" in resp.text:
-                log.warning(
-                    "Cloudflare Bot Management detected at %s. "
-                    "Please run WatchFinder on a residential network and provide "
-                    "your forum session cookies via Settings.",
-                    url,
+            if SCRAPE_DO_KEY:
+                # Route through Scrape.do — handles Cloudflare and rotating proxies
+                cookie_header = "; ".join(
+                    f"{k}={v}" for k, v in self.session.cookies.items()
                 )
-                return None
+                headers = {"Cookie": cookie_header} if cookie_header else {}
+                for attempt in range(2):
+                    resp = requests.get(
+                        "https://api.scrape.do/",
+                        params={
+                            "token": SCRAPE_DO_KEY,
+                            "url": url,
+                            "forwardHeaders": "true",
+                        },
+                        headers=headers,
+                        timeout=60,
+                    )
+                    if resp.status_code != 502:
+                        break
+                    log.warning("Scrape.do 502 on attempt %d, retrying…", attempt + 1)
+                    time.sleep(3)
+            else:
+                resp = self.session.get(url, timeout=20, **kwargs)
+                if resp.status_code == 403 and "Just a moment" in resp.text:
+                    log.warning(
+                        "Cloudflare Bot Management detected at %s. "
+                        "Please run WatchFinder on a residential network and provide "
+                        "your forum session cookies via Settings.",
+                        url,
+                    )
+                    return None
             resp.raise_for_status()
             return resp
         except requests.Timeout:
             log.warning("Timeout fetching %s", url)
         except requests.HTTPError as e:
-            log.warning("HTTP error fetching %s: %s", url, e)
+            # Avoid logging Scrape.do URL which contains the API token
+            status = e.response.status_code if e.response is not None else "?"
+            log.warning("HTTP %s fetching %s", status, url)
         except requests.RequestException as e:
             log.warning("Request error fetching %s: %s", url, e)
         return None
+
+    def _fetch_image(self, url: str) -> str | None:
+        """Download image via _get() (Scrape.do-aware) and save locally."""
+        IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+        url_hash = hashlib.md5(url.encode()).hexdigest()
+        for ext in (".jpg", ".png", ".webp", ".gif"):
+            if (IMAGE_DIR / (url_hash + ext)).exists():
+                return f"/static/images/{url_hash}{ext}"
+        resp = self._get(url)
+        if not resp:
+            return None
+        try:
+            content_type = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+            ext = mimetypes.guess_extension(content_type) or ".jpg"
+            ext = {".jpe": ".jpg", ".jpeg": ".jpg"}.get(ext, ext)
+            if ext not in (".jpg", ".png", ".webp", ".gif"):
+                ext = ".jpg"
+            filepath = IMAGE_DIR / (url_hash + ext)
+            filepath.write_bytes(resp.content)
+            log.info("Image cached: %s → %s", url[:60], filepath.name)
+            return f"/static/images/{url_hash}{ext}"
+        except Exception as e:
+            log.warning("Image download failed for %s: %s", url[:60], e)
+            return None
 
     def run(self, pages: int = 3, target_year: int = TARGET_YEAR) -> dict:
         raise NotImplementedError
@@ -327,18 +412,70 @@ class RolexForumsScraper(BaseScraper):
         if not resp:
             return None
         soup = BeautifulSoup(resp.text, "lxml")
-        post = (
-            soup.find("div", class_=re.compile(r"postbody|post-content|content"))
-            or soup.find("blockquote", class_=re.compile(r"postcontent|restore"))
-        )
+
+        # ── Locate first post body ────────────────────────────────────────────
+        # vBulletin 3.x (used by RolexForums): <table id="post{ID}"> wraps each
+        # post; the text lives in <div id="post_message_{ID}"> and the full cell
+        # (including attachments) is <td id="td_post_{ID}">.
+        post = None
+        td_post = None
+        first_post_table = soup.find("table", id=re.compile(r"^post\d+"))
+        if first_post_table:
+            m = re.search(r"\d+", first_post_table["id"])
+            if m:
+                pid = m.group()
+                post    = soup.find("div", id=f"post_message_{pid}")
+                td_post = soup.find("td",  id=f"td_post_{pid}")
+
+        # vBulletin 4 / other forums fallback
+        if not post:
+            post = (
+                soup.find("blockquote", class_=re.compile(r"\bpostcontent\b"))
+                or soup.find("div", class_=re.compile(r"\bpostbody\b"))
+                or soup.find("div", class_=re.compile(r"\bpost-content\b"))
+            )
+
         body = post.get_text(" ", strip=True) if post else ""
         combined = f"{stub['title']} {body}"
 
+        # ── Find first real listing photo ─────────────────────────────────────
+        # For vB3 search the whole td_post (includes forum attachments that live
+        # outside post_message); fall back to the post div then the whole page.
         image_url = None
-        if post:
-            img = post.find("img", src=re.compile(r"\.(jpg|jpeg|png|webp)", re.I))
-            if img:
-                image_url = img.get("src") or img.get("data-src")
+        search_scope = []
+        if td_post:
+            search_scope = td_post.find_all("img")
+        if not search_scope and first_post_table:
+            search_scope = first_post_table.find_all("img")
+        if not search_scope:
+            search_scope = soup.find_all("img")
+        for img in search_scope:
+            src = img.get("src") or img.get("data-src") or img.get("data-lazy-src") or ""
+            if not src:
+                continue
+            if re.search(r"smilie|smiley|icon|avatar|emoji|pixel|spacer|logo|btn|button", src, re.I):
+                continue
+            try:
+                w = img.get("width", "")
+                h = img.get("height", "")
+                if (w and int(w) < 80) or (h and int(h) < 80):
+                    continue
+            except (ValueError, TypeError):
+                pass  # non-integer attribute like "100%" — don't skip
+            if src.startswith("http"):
+                pass  # already absolute
+            elif src.startswith("/"):
+                src = urljoin(self.BASE, src)
+            elif src.startswith("attachment.php"):
+                # vBulletin forum attachment — make absolute
+                src = self.BASE + "/" + src
+            else:
+                continue
+            image_url = src
+            break
+
+        if image_url:
+            image_url = self._fetch_image(image_url)
 
         seller = stub.get("seller")
         if not seller:
@@ -346,14 +483,24 @@ class RolexForumsScraper(BaseScraper):
             if at:
                 seller = at.get_text(strip=True)
 
-        brand = extract_brand(combined)
+        brand = extract_brand(stub['title']) or extract_brand(combined)
+        price = extract_price(combined)
+        year  = extract_year(combined)
+        log.info(
+            "[RolexForums] parsed: price=%s year=%s brand=%s image=%s | %s",
+            f"${price:,.0f}" if price else "—",
+            year or "—",
+            brand or "—",
+            "yes" if image_url else "no",
+            stub["title"][:80],
+        )
         return {
             "title": stub["title"],
             "brand": brand,
             "model": extract_model(combined, brand),
             "reference": extract_reference(combined),
-            "year": extract_year(combined),
-            "price": extract_price(combined),
+            "year": year,
+            "price": price,
             "currency": "USD",
             "condition": extract_condition(combined),
             "seller": seller,
@@ -364,55 +511,91 @@ class RolexForumsScraper(BaseScraper):
             "source_id": self.source_id,
         }
 
-    def run(self, pages: int = 3, target_year: int = TARGET_YEAR) -> dict:
+    def run(self, pages: int = 3, target_year: int = TARGET_YEAR,
+            progress_callback=None) -> dict:
         stats = {"source": self.SOURCE_NAME, "pages": 0, "threads": 0,
                  "new": 0, "updated": 0, "priced": 0, "errors": 0,
                  "blocked": False}
+        stats_lock = threading.Lock()
 
-        for page in range(1, pages + 1):
-            url = self.FORUM_URL if page == 1 else f"{self.FORUM_URL}&page={page}"
-            log.info("[RolexForums] Scraping page %d: %s", page, url)
+        def _fetch_one(stub: dict) -> tuple[dict | None, dict]:
+            listing = self._parse_thread(stub["url"], stub)
+            if listing:
+                listing = enrich_with_price(listing, target_year)
+            return listing, stub
+
+        for page_num in range(1, pages + 1):
+            url = self.FORUM_URL if page_num == 1 else f"{self.FORUM_URL}&page={page_num}"
+            log.info("[RolexForums] Fetching forum index page %d…", page_num)
             resp = self._get(url)
             if not resp:
-                stats["errors"] += 1
-                stats["blocked"] = True
-                log.warning(
-                    "[RolexForums] Could not fetch page %d — may be blocked by Cloudflare. "
-                    "Run WatchFinder locally with residential internet and provide session cookies.",
-                    page,
-                )
+                with stats_lock:
+                    stats["errors"] += 1
+                    stats["blocked"] = True
+                log.warning("[RolexForums] Could not fetch page %d", page_num)
                 break
 
             stubs = self._parse_forum_page(resp.text)
             if not stubs:
-                log.warning("[RolexForums] No threads found on page %d", page)
-                stats["errors"] += 1
+                log.warning("[RolexForums] No threads found on page %d", page_num)
+                with stats_lock:
+                    stats["errors"] += 1
                 break
 
-            stats["pages"] += 1
-            for stub in stubs:
-                if not is_for_sale(stub["title"]):
-                    continue
-                stats["threads"] += 1
-                time.sleep(self.delay)
-                try:
-                    listing = self._parse_thread(stub["url"], stub)
-                    if not listing:
-                        stats["errors"] += 1
-                        continue
-                    listing = enrich_with_price(listing, target_year)
-                    if listing.get("price_rating") and listing["price_rating"] != "N/A":
-                        stats["priced"] += 1
-                    _, is_new = db.upsert_listing(listing)
-                    if is_new:
-                        stats["new"] += 1
-                    else:
-                        stats["updated"] += 1
-                except Exception as e:
-                    log.exception("[RolexForums] Error processing %s: %s", stub.get("url"), e)
-                    stats["errors"] += 1
+            new_stubs = [
+                s for s in stubs
+                if is_for_sale(s["title"]) and not db.listing_url_exists(s["url"])
+            ]
+            log.info(
+                "[RolexForums] Page %d: %d total, %d new, %d already in DB",
+                page_num, len(stubs), len(new_stubs), len(stubs) - len(new_stubs),
+            )
+            with stats_lock:
+                stats["pages"] += 1
 
-            time.sleep(self.delay)
+            processed = 0
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                futures = {pool.submit(_fetch_one, stub): stub for stub in new_stubs}
+                for future in as_completed(futures):
+                    stub = futures[future]
+                    try:
+                        listing, _ = future.result()
+                    except Exception as e:
+                        log.exception("[RolexForums] Worker error on %s: %s", stub.get("url"), e)
+                        with stats_lock:
+                            stats["errors"] += 1
+                        continue
+
+                    with stats_lock:
+                        processed += 1
+                        stats["threads"] += 1
+
+                    if progress_callback:
+                        progress_callback({
+                            "source": self.SOURCE_NAME,
+                            "current": stub["title"][:80],
+                            "processed": processed,
+                            "total": len(new_stubs),
+                        })
+
+                    if not listing:
+                        with stats_lock:
+                            stats["errors"] += 1
+                        continue
+
+                    try:
+                        _, is_new = db.upsert_listing(listing)
+                        with stats_lock:
+                            if listing.get("price_rating") and listing["price_rating"] != "N/A":
+                                stats["priced"] += 1
+                            if is_new:
+                                stats["new"] += 1
+                            else:
+                                stats["updated"] += 1
+                    except Exception as e:
+                        log.exception("[RolexForums] DB error for %s: %s", stub.get("url"), e)
+                        with stats_lock:
+                            stats["errors"] += 1
 
         db.mark_source_scraped(self.source_id)
         return stats
@@ -453,7 +636,7 @@ class RedditWatchexchangeScraper(BaseScraper):
             return None
 
         combined = f"{title} {selftext}"
-        brand = extract_brand(combined)
+        brand = extract_brand(title) or extract_brand(combined)
 
         # Reddit posts often have an image link as the post URL
         image_url = None
@@ -486,7 +669,7 @@ class RedditWatchexchangeScraper(BaseScraper):
             "source_id": self.source_id,
         }
 
-    def run(self, pages: int = 3, target_year: int = TARGET_YEAR) -> dict:
+    def run(self, pages: int = 3, target_year: int = TARGET_YEAR, progress_callback=None) -> dict:
         stats = {"source": self.SOURCE_NAME, "pages": 0, "threads": 0,
                  "new": 0, "updated": 0, "priced": 0, "errors": 0,
                  "blocked": False}
@@ -536,6 +719,8 @@ class RedditWatchexchangeScraper(BaseScraper):
                     listing = self._parse_post(post)
                     if not listing:
                         continue
+                    if listing.get("image_url"):
+                        listing["image_url"] = self._fetch_image(listing["image_url"])
                     listing = enrich_with_price(listing, target_year)
                     if listing.get("price_rating") and listing["price_rating"] != "N/A":
                         stats["priced"] += 1
@@ -565,6 +750,7 @@ def run_all_scrapers(
     target_year: int = TARGET_YEAR,
     cookies: dict[str, str] | None = None,
     sources: list[str] | None = None,
+    progress_callback=None,
 ) -> dict:
     """Run all configured scrapers. Returns combined stats."""
     cookies = cookies or {}
@@ -581,7 +767,8 @@ def run_all_scrapers(
         cookie_str = cookies.get(name, "")
         try:
             s = cls(cookie_string=cookie_str, delay=2.0)
-            result = s.run(pages=pages, target_year=target_year)
+            result = s.run(pages=pages, target_year=target_year,
+                           progress_callback=progress_callback)
             all_stats.append(result)
             log.info("Scraper '%s' done: %s", name, result)
         except Exception as e:
