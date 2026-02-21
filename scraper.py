@@ -208,11 +208,22 @@ def extract_reference(text: str) -> str | None:
 
 
 def extract_brand(text: str) -> str | None:
+    """Return the brand whose alias keyword appears earliest in the text.
+
+    Sorting by key length (longest-first) was wrong: e.g. "royal oak" (9)
+    matched before "datejust" (8) causing Rolex listings that mention a Royal
+    Oak trade to be labelled as Audemars Piguet.  Using leftmost position
+    means the primary subject of a title wins over incidental mentions.
+    """
     lower = text.lower()
-    for key, val in sorted(BRAND_ALIASES.items(), key=lambda x: -len(x[0])):
-        if key in lower:
-            return val
-    return None
+    best_pos = len(lower)
+    best_brand = None
+    for key, val in BRAND_ALIASES.items():
+        pos = lower.find(key)
+        if pos != -1 and pos < best_pos:
+            best_pos = pos
+            best_brand = val
+    return best_brand
 
 
 def extract_model(text: str, brand: str | None = None) -> str | None:
@@ -327,28 +338,75 @@ class BaseScraper:
         return None
 
     def _fetch_image(self, url: str) -> str | None:
-        """Download image via _get() (Scrape.do-aware) and save locally."""
+        """Download an image and cache it locally.
+
+        CDN-hosted images (Imgur, Google Photos, Postimg, etc.) are fetched
+        directly — Scrape.do's headless browser can't return raw image binaries
+        and returns 502 for i.imgur.com URLs.  Forum attachments (attachment.php)
+        fall back to _get() so they benefit from session cookies / Scrape.do.
+        """
         IMAGE_DIR.mkdir(parents=True, exist_ok=True)
         url_hash = hashlib.md5(url.encode()).hexdigest()
         for ext in (".jpg", ".png", ".webp", ".gif"):
             if (IMAGE_DIR / (url_hash + ext)).exists():
                 return f"/static/images/{url_hash}{ext}"
-        resp = self._get(url)
-        if not resp:
-            return None
+
+        resp = None
+
+        # Try a direct HTTP fetch first (no Scrape.do).  This works for all
+        # public CDN image hosts and avoids the Scrape.do 502 on Imgur.
         try:
-            content_type = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
-            ext = mimetypes.guess_extension(content_type) or ".jpg"
-            ext = {".jpe": ".jpg", ".jpeg": ".jpg"}.get(ext, ext)
-            if ext not in (".jpg", ".png", ".webp", ".gif"):
-                ext = ".jpg"
-            filepath = IMAGE_DIR / (url_hash + ext)
-            filepath.write_bytes(resp.content)
-            log.info("Image cached: %s → %s", url[:60], filepath.name)
-            return f"/static/images/{url_hash}{ext}"
-        except Exception as e:
-            log.warning("Image download failed for %s: %s", url[:60], e)
-            return None
+            direct = requests.get(
+                url,
+                headers={
+                    "User-Agent": BASE_HEADERS["User-Agent"],
+                    "Referer": "https://www.rolexforums.com/",
+                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                },
+                timeout=20,
+                allow_redirects=True,
+            )
+            ct = direct.headers.get("Content-Type", "")
+            if direct.status_code == 200 and ct.startswith("image/"):
+                resp = direct
+        except Exception:
+            pass
+
+        # Fall back to _get() (Scrape.do-aware) only for forum-hosted attachments.
+        # External CDN URLs (Imgur etc.) cause Scrape.do 502s — skip the fallback
+        # for those and go straight to the browser-URL fallback below.
+        is_forum_attachment = "attachment.php" in url or (
+            not url.startswith("http") or
+            any(h in url for h in ("rolexforums.com", "watchuseek.com", "timezone.com"))
+        )
+        if resp is None and is_forum_attachment:
+            resp = self._get(url)
+
+        if resp:
+            try:
+                content_type = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+                if content_type.startswith("image/"):
+                    ext = mimetypes.guess_extension(content_type) or ".jpg"
+                    ext = {".jpe": ".jpg", ".jpeg": ".jpg"}.get(ext, ext)
+                    if ext not in (".jpg", ".png", ".webp", ".gif"):
+                        ext = ".jpg"
+                    filepath = IMAGE_DIR / (url_hash + ext)
+                    filepath.write_bytes(resp.content)
+                    log.info("Image cached: %s → %s", url[:60], filepath.name)
+                    return f"/static/images/{url_hash}{ext}"
+                else:
+                    log.warning("Non-image response (%s) for %s", content_type, url[:80])
+            except Exception as e:
+                log.warning("Image download failed for %s: %s", url[:60], e)
+
+        # Server-side download failed (cloud IP blocked by CDN, Scrape.do 502, etc.).
+        # Return the original URL so the browser can fetch it directly — this works
+        # for public CDN hosts (Imgur, Google Photos, Postimg) which are accessible
+        # from user browsers but not cloud server IPs.
+        if url.startswith("http") and "attachment.php" not in url:
+            log.info("Falling back to original URL for browser-side load: %s", url[:80])
+            return url
+        return None
 
     def run(self, pages: int = 3, target_year: int = TARGET_YEAR) -> dict:
         raise NotImplementedError
