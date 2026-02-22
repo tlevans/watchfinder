@@ -25,6 +25,8 @@ def main():
     parser.add_argument("--port", type=int, default=5000, help="Web server port (default 5000)")
     parser.add_argument("--host", default="0.0.0.0", help="Web server host (default 0.0.0.0)")
     parser.add_argument("--debug", action="store_true", help="Enable Flask debug mode")
+    parser.add_argument("--backfill-prices", action="store_true",
+                        help="Re-fetch OP comments for Reddit listings missing prices, then exit")
     args = parser.parse_args()
 
     import database as db
@@ -32,6 +34,13 @@ def main():
 
     if args.init_db:
         print("Database initialised.")
+        return
+
+    if args.backfill_prices:
+        import scraper as sc
+        print("Backfilling prices for Reddit listings with no price…")
+        stats = sc.backfill_reddit_prices(target_year=args.target_year)
+        print(f"Done: {stats['updated']} updated, {stats['skipped']} skipped, {stats['errors']} errors")
         return
 
     if args.scrape:

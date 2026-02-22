@@ -686,13 +686,17 @@ class RedditWatchexchangeScraper(BaseScraper):
         self.session.headers["Accept"] = "application/json"
 
     def _fetch_op_comment(self, post_id: str, op_author: str) -> str:
-        """Fetch the first comment by the OP (post author) from a Reddit thread.
+        """Fetch the best listing-detail comment from a Reddit thread.
 
         r/Watchexchange sellers post as image/gallery (empty selftext) and put
         their structured listing details (price, year, condition, etc.) in a
-        comment. We specifically want the OP's comment, not other users' replies
-        like 'PM!' which appear first.  Falls back to first non-AutoModerator
-        comment if the OP hasn't commented yet.
+        comment — sometimes the first OP comment, sometimes a later one.
+
+        Strategy:
+          1. Collect all OP comments; return the one containing a price pattern.
+          2. If no OP comment has a price, return the longest OP comment.
+          3. If OP hasn't commented yet, fall back to the first non-AutoModerator
+             comment that contains a price pattern, then the longest such comment.
         """
         url = f"https://www.reddit.com/r/Watchexchange/comments/{post_id}.json"
         try:
@@ -704,7 +708,8 @@ class RedditWatchexchangeScraper(BaseScraper):
             if not isinstance(data, list) or len(data) < 2:
                 return ""
             comments = data[1].get("data", {}).get("children", [])
-            first_non_mod = ""
+            op_comments = []
+            non_mod_comments = []
             for comment in comments:
                 c = comment.get("data", {})
                 author = c.get("author", "")
@@ -713,19 +718,23 @@ class RedditWatchexchangeScraper(BaseScraper):
                     continue
                 if author.lower() == "automoderator":
                     continue
-                # Prefer OP's own comment
-                if author.lower() == op_author.lower():
-                    return body
-                if not first_non_mod:
-                    first_non_mod = body
-            return first_non_mod
+                if op_author and author.lower() == op_author.lower():
+                    op_comments.append(body)
+                non_mod_comments.append(body)
+            # Prefer OP comment with a price; fall back to longest OP comment
+            candidates = op_comments if op_comments else non_mod_comments
+            with_price = [b for b in candidates if PRICE_RE.search(b)]
+            if with_price:
+                return max(with_price, key=len)
+            if candidates:
+                return max(candidates, key=len)
         except Exception as e:
             log.warning("[Reddit] Failed to fetch thread %s: %s", post_id, e)
         return ""
 
     def _parse_post(self, post_data: dict) -> dict | None:
         title = post_data.get("title", "")
-        selftext = post_data.get("selftext", "")
+        selftext = post_data.get("selftext") or ""  # API may return null
         url = post_data.get("url", "")
         permalink = "https://reddit.com" + post_data.get("permalink", "")
         author = post_data.get("author", "")
@@ -883,6 +892,77 @@ class RedditWatchexchangeScraper(BaseScraper):
 
         db.mark_source_scraped(self.source_id)
         return stats
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Reddit price backfill
+# ──────────────────────────────────────────────────────────────────────────────
+
+def backfill_reddit_prices(target_year: int = TARGET_YEAR) -> dict:
+    """Re-fetch OP comments for Reddit listings that have no price.
+
+    Useful for listings that were scraped before the OP commented, or where
+    the _fetch_op_comment call timed out during the original scrape.
+    Returns stats dict with updated/skipped/errors counts.
+    """
+    import sqlite3
+    scraper = RedditWatchexchangeScraper()
+    source_id = db.get_source_id("Reddit r/Watchexchange")
+    stats = {"updated": 0, "skipped": 0, "errors": 0}
+
+    conn = sqlite3.connect(str(Path(__file__).parent / "watches.db"))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT id, listing_url, title, seller FROM listings "
+        "WHERE source_id=? AND price IS NULL",
+        (source_id,),
+    ).fetchall()
+    conn.close()
+
+    log.info("[Backfill] %d Reddit listings with no price to process", len(rows))
+    for row in rows:
+        listing_id = row["id"]
+        listing_url = row["listing_url"]
+        title = row["title"]
+        op_author = row["seller"] or ""
+        # Extract post_id from permalink
+        m = re.search(r"/comments/([a-z0-9]+)/", listing_url)
+        if not m:
+            stats["skipped"] += 1
+            continue
+        post_id = m.group(1)
+        try:
+            thread_body = scraper._fetch_op_comment(post_id, op_author=op_author)
+            if not thread_body:
+                stats["skipped"] += 1
+                continue
+            combined = f"{title} {thread_body}"
+            price = extract_price(combined)
+            if price is None:
+                log.debug("[Backfill] no price in thread %s: %s", post_id, thread_body[:100])
+                stats["skipped"] += 1
+                continue
+            brand = extract_brand(title) or extract_brand(combined)
+            year = extract_year(combined)
+            condition = extract_condition(combined)
+            conn = sqlite3.connect(str(Path(__file__).parent / "watches.db"))
+            conn.execute(
+                "UPDATE listings SET price=?, brand=COALESCE(brand,?), "
+                "year=COALESCE(year,?), condition=COALESCE(condition,?), "
+                "description=COALESCE(NULLIF(description,''),?) WHERE id=?",
+                (price, brand, year, condition, thread_body[:2000], listing_id),
+            )
+            conn.commit()
+            conn.close()
+            log.info("[Backfill] updated listing %d (%s) price=$%.0f", listing_id, post_id, price)
+            stats["updated"] += 1
+        except Exception as e:
+            log.warning("[Backfill] error on listing %d: %s", listing_id, e)
+            stats["errors"] += 1
+        time.sleep(1)  # be polite to Reddit API
+
+    log.info("[Backfill] done: %s", stats)
+    return stats
 
 
 # ──────────────────────────────────────────────────────────────────────────────
