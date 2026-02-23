@@ -865,9 +865,25 @@ class RedditWatchexchangeScraper(BaseScraper):
             stats["pages"] += 1
             after = data["data"].get("after")
 
+            new_on_page = 0
             for child in children:
                 post = child.get("data", {})
                 stats["threads"] += 1
+                title = post.get("title", "")
+                flair = (post.get("link_flair_text") or "").upper()
+                permalink = "https://reddit.com" + post.get("permalink", "")
+
+                # Pre-filter before _parse_post() to avoid expensive
+                # _fetch_op_comment() Scrape.do calls for posts we've already
+                # processed or that are clearly not for-sale listings.
+                if not is_for_sale(title):
+                    continue
+                if "WTB" in flair or "ISO" in flair:
+                    continue
+                if db.listing_url_exists(permalink):
+                    continue
+
+                new_on_page += 1
                 try:
                     listing = self._parse_post(post)
                     if not listing:
@@ -887,6 +903,11 @@ class RedditWatchexchangeScraper(BaseScraper):
                     stats["errors"] += 1
 
             if not after:
+                break
+            # Stop fetching older pages once a full page has no new listings —
+            # Reddit feed is newest-first so deeper pages won't have new content.
+            if new_on_page == 0:
+                log.info("[Reddit] No new listings on page %d, stopping early.", page_num + 1)
                 break
             time.sleep(self.delay)
 
